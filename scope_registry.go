@@ -21,6 +21,8 @@
 package tally
 
 import (
+	"hash/maphash"
+	"runtime"
 	"sync"
 	"unsafe"
 )
@@ -28,57 +30,80 @@ import (
 var scopeRegistryKey = keyForPrefixedStringMaps
 
 type scopeRegistry struct {
-	mu        sync.RWMutex
+	seed      maphash.Seed
 	root      *scope
-	subscopes map[string]*scope
+	subscopes []*bucketScope
+}
+
+type bucketScope struct {
+	sync.RWMutex
+	s map[string]*scope
 }
 
 func newScopeRegistry(root *scope) *scopeRegistry {
+	procs := runtime.GOMAXPROCS(-1)
+
 	r := &scopeRegistry{
 		root:      root,
-		subscopes: make(map[string]*scope),
+		subscopes: make([]*bucketScope, procs),
+		seed:      maphash.MakeSeed(),
 	}
-	r.subscopes[scopeRegistryKey(root.prefix, root.tags)] = root
+
+	for i := 0; i < procs; i++ {
+		r.subscopes[i] = &bucketScope{
+			s: make(map[string]*scope),
+		}
+		r.subscopes[i].s[scopeRegistryKey(root.prefix, root.tags)] = root
+	}
+
 	return r
 }
 
 func (r *scopeRegistry) Report(reporter StatsReporter) {
 	defer r.purgeIfRootClosed()
-	r.mu.RLock()
-	defer r.mu.RUnlock()
 
-	for name, s := range r.subscopes {
-		s.report(reporter)
+	for _, ptr := range r.subscopes {
+		ptr.RLock()
 
-		if s.closed.Load() {
-			r.removeWithRLock(name)
-			s.clearMetrics()
+		for name, s := range ptr.s {
+			s.report(reporter)
+
+			if s.closed.Load() {
+				r.removeWithRLock(ptr, name)
+				s.clearMetrics()
+			}
 		}
+
+		ptr.RUnlock()
 	}
 }
 
 func (r *scopeRegistry) CachedReport() {
 	defer r.purgeIfRootClosed()
 
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	for _, ptr := range r.subscopes {
+		ptr.RLock()
 
-	for name, s := range r.subscopes {
-		s.cachedReport()
+		for name, s := range ptr.s {
+			s.cachedReport()
 
-		if s.closed.Load() {
-			r.removeWithRLock(name)
-			s.clearMetrics()
+			if s.closed.Load() {
+				r.removeWithRLock(ptr, name)
+				s.clearMetrics()
+			}
 		}
+
+		ptr.RUnlock()
 	}
 }
 
 func (r *scopeRegistry) ForEachScope(f func(*scope)) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	for _, s := range r.subscopes {
-		f(s)
+	for _, ptr := range r.subscopes {
+		for _, s := range ptr.s {
+			ptr.RLock()
+			f(s)
+			ptr.RUnlock()
+		}
 	}
 }
 
@@ -88,28 +113,33 @@ func (r *scopeRegistry) Subscope(parent *scope, prefix string, tags map[string]s
 	}
 
 	buf := keyForPrefixedStringMapsAsKey(make([]byte, 0, 256), prefix, parent.tags, tags)
-	r.mu.RLock()
+	h := maphash.Hash{}
+	h.SetSeed(r.seed)
+	_, _ = h.Write(buf)
+	ptr := r.subscopes[h.Sum64()%uint64(len(r.subscopes))]
+
+	ptr.RLock()
 	// buf is stack allocated and casting it to a string for lookup from the cache
 	// as the memory layout of []byte is a superset of string the below casting is safe and does not do any alloc
 	// However it cannot be used outside of the stack; a heap allocation is needed if that string needs to be stored
 	// in the map as a key
-	if s, ok := r.lockedLookup(*(*string)(unsafe.Pointer(&buf))); ok {
-		r.mu.RUnlock()
+	if s, ok := r.lockedLookup(ptr, *(*string)(unsafe.Pointer(&buf))); ok {
+		ptr.RUnlock()
 		return s
 	}
-	r.mu.RUnlock()
+	ptr.RUnlock()
 
 	// heap allocating the buf as a string to keep the key in the subscopes map
 	preSanitizeKey := string(buf)
 	tags = parent.copyAndSanitizeMap(tags)
 	key := scopeRegistryKey(prefix, parent.tags, tags)
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	ptr.Lock()
+	defer ptr.Unlock()
 
-	if s, ok := r.lockedLookup(key); ok {
-		if _, ok = r.lockedLookup(preSanitizeKey); !ok {
-			r.subscopes[preSanitizeKey] = s
+	if s, ok := r.lockedLookup(ptr, key); ok {
+		if _, ok = r.lockedLookup(ptr, preSanitizeKey); !ok {
+			ptr.s[preSanitizeKey] = s
 		}
 		return s
 	}
@@ -138,15 +168,15 @@ func (r *scopeRegistry) Subscope(parent *scope, prefix string, tags map[string]s
 		bucketCache:     parent.bucketCache,
 		done:            make(chan struct{}),
 	}
-	r.subscopes[key] = subscope
-	if _, ok := r.lockedLookup(preSanitizeKey); !ok {
-		r.subscopes[preSanitizeKey] = subscope
+	ptr.s[key] = subscope
+	if _, ok := r.lockedLookup(ptr, preSanitizeKey); !ok {
+		ptr.s[preSanitizeKey] = subscope
 	}
 	return subscope
 }
 
-func (r *scopeRegistry) lockedLookup(key string) (*scope, bool) {
-	ss, ok := r.subscopes[key]
+func (r *scopeRegistry) lockedLookup(ptr *bucketScope, key string) (*scope, bool) {
+	ss, ok := ptr.s[key]
 	return ss, ok
 }
 
@@ -155,22 +185,21 @@ func (r *scopeRegistry) purgeIfRootClosed() {
 		return
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	for k, s := range r.subscopes {
-		_ = s.Close()
-		s.clearMetrics()
-		delete(r.subscopes, k)
+	for _, ptr := range r.subscopes {
+		for k, s := range ptr.s {
+			_ = s.Close()
+			s.clearMetrics()
+			delete(ptr.s, k)
+		}
 	}
 }
 
-func (r *scopeRegistry) removeWithRLock(key string) {
+func (r *scopeRegistry) removeWithRLock(ptr *bucketScope, key string) {
 	// n.b. This function must lock the registry for writing and return it to an
 	//      RLocked state prior to exiting. Defer order is important (LIFO).
-	r.mu.RUnlock()
-	defer r.mu.RLock()
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.subscopes, key)
+	ptr.RUnlock()
+	defer ptr.RLock()
+	ptr.Lock()
+	defer ptr.Unlock()
+	delete(ptr.s, key)
 }
