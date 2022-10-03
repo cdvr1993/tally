@@ -22,7 +22,9 @@ package tally
 
 import (
 	"fmt"
+	"math/rand"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -137,6 +139,75 @@ func BenchmarkScopeTaggedNoCachedSubscopes(b *testing.B) {
 			"qux": values[n],
 		})
 	}
+}
+
+func BenchmarkScopeTaggedRandomCachedSubscopesParallel(b *testing.B) {
+	root, _ := NewRootScope(ScopeOptions{
+		Prefix:   "funkytown",
+		Reporter: NullStatsReporter,
+		Tags: map[string]string{
+			"style":     "funky",
+			"hair":      "wavy",
+			"jefferson": "starship",
+		},
+	}, 0)
+
+	b.ResetTimer()
+
+	index := int64(0)
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			n := atomic.AddInt64(&index, 1)
+			value := strconv.Itoa(int(n))
+
+			root.Tagged(map[string]string{
+				"foo": value,
+				"baz": value,
+				"qux": value,
+			})
+		}
+	})
+}
+
+func BenchmarkScopeTaggedRandomCachedSubscopesParallelRandom(b *testing.B) {
+	percentageCached := 5
+	root, _ := NewRootScope(ScopeOptions{
+		Prefix:   "funkytown",
+		Reporter: NullStatsReporter,
+		Tags: map[string]string{
+			"style":     "funky",
+			"hair":      "wavy",
+			"jefferson": "starship",
+		},
+	}, 0)
+
+	cachedMap := map[string]string{
+		"foo": "any",
+		"baz": "any",
+		"qux": "any",
+	}
+	root.Tagged(cachedMap)
+
+	b.ResetTimer()
+
+	index := int64(0)
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if rand.Intn(100) < percentageCached {
+				root.Tagged(cachedMap)
+				continue
+			}
+
+			n := atomic.AddInt64(&index, 1)
+			value := strconv.Itoa(int(n))
+
+			root.Tagged(map[string]string{
+				"foo": value,
+				"baz": value,
+				"qux": value,
+			})
+		}
+	})
 }
 
 func BenchmarkNameGenerationNoPrefix(b *testing.B) {
