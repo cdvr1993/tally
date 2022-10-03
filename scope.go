@@ -108,6 +108,7 @@ type ScopeOptions struct {
 // a reporting interval.
 // Must provide either a StatsReporter or a CachedStatsReporter.
 func NewRootScope(opts ScopeOptions, interval time.Duration) (Scope, io.Closer) {
+	panic("hello world")
 	s := newRootScope(opts, interval)
 	return s, s
 }
