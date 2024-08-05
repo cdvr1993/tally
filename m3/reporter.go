@@ -149,6 +149,7 @@ type Options struct {
 	HistogramBucketIDName       string
 	HistogramBucketName         string
 	HistogramBucketTagPrecision uint
+	InjectedTransport           thrift.TTransport
 }
 
 // NewReporter creates a new M3 reporter.
@@ -172,12 +173,17 @@ func NewReporter(opts Options) (Reporter, error) {
 	// Create M3 thrift client
 	var trans thrift.TTransport
 	var err error
-	if len(opts.HostPorts) == 0 {
-		err = errNoHostPorts
-	} else if len(opts.HostPorts) == 1 {
-		trans, err = thriftudp.NewTUDPClientTransport(opts.HostPorts[0], "")
+
+	if opts.InjectedTransport == nil {
+		if len(opts.HostPorts) == 0 {
+			err = errNoHostPorts
+		} else if len(opts.HostPorts) == 1 {
+			trans, err = thriftudp.NewTUDPClientTransport(opts.HostPorts[0], "")
+		} else {
+			trans, err = thriftudp.NewTMultiUDPClientTransport(opts.HostPorts, "")
+		}
 	} else {
-		trans, err = thriftudp.NewTMultiUDPClientTransport(opts.HostPorts, "")
+		trans = opts.InjectedTransport
 	}
 	if err != nil {
 		return nil, err
